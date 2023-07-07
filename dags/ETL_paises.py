@@ -11,6 +11,11 @@ from airflow.operators.python_operator import PythonOperator
 #from airflow.utils.dates import days_ago
 import pandas as pd
 import os
+from email import message
+import smtplib
+from airflow.sensors.python import PythonSensor
+from airflow.contrib.sensors.file_sensor import FileSensor
+from pathlib import Path
 
 dag_path = os.getcwd()     #path original.. home en Docker
 
@@ -29,22 +34,6 @@ redshift_conn = {
     'port': '5439',
     'pwd': pwd
 }
-
-# argumentos por defecto para el DAG
-default_args = {
-    'owner': 'AndreaSA',
-    'start_date': datetime(2023,6,26),
-    'retries':5,
-    'retry_delay': timedelta(minutes=5)
-}
-
-BC_dag = DAG(
-    dag_id='ETL_paises',
-    default_args=default_args,
-    description='Agrega data de países de forma mensual',
-    schedule_interval="@monthly",
-    catchup=False
-)
 
 dag_path = os.getcwd()     #path original.. home en Docker
 
@@ -112,10 +101,10 @@ def extraer_data(exec_date):
         raise e       
 
 # Funcion de transformacion en tabla
-def transformar_data(exec_date):       
-    print(f"Transformando la data para la fecha: {exec_date}") 
+def transformar_data(exec_date, ti):       
+    print(f"Transformando la data para la fecha: {exec_date}")
     date = datetime.strptime(exec_date, '%Y-%m-%d %H')
-    dt = pd.read_csv(dag_path+'/raw_data/'+"data_"+str(date.year)+'-'+str(date.month)+'-'+str(date.day)+'-'+str(date.hour)+".csv")
+    df = pd.read_csv(dag_path+'/raw_data/'+"data_"+str(date.year)+'-'+str(date.month)+'-'+str(date.day)+'-'+str(date.hour)+".csv")
     # Fiiltrar el topico de interes: mining_stats
    #Explorando el dataframe
     df.head()
@@ -142,6 +131,10 @@ def transformar_data(exec_date):
     df_2.rename(columns={'Nombre_comun':'pais_max_poblacion_nombre'},inplace=True)
     df_2.to_csv(dag_path+'/processed_data/'+"data_"+str(date.year)+'-'+str(date.month)+'-'+str(date.day)+'-'+str(date.hour)+".csv", index=False)
     del(df_aux)
+    # ti.xcom_push(
+    #     key='nombre_data',
+    #     value=f'data_{str(date.year)}-{str(date.month)}-{str(date.day)}-{str(date.hour)}',
+    # )
 
 # Funcion conexion a redshift
 def conexion_redshift(exec_date):
@@ -164,7 +157,7 @@ def conexion_redshift(exec_date):
 
 from psycopg2.extras import execute_values
 # Funcion de envio de data
-def cargar_data(exec_date):
+def cargar_data(exec_date,ti):
     print(f"Cargando la data para la fecha: {exec_date}")
     date = datetime.strptime(exec_date, '%Y-%m-%d %H')
     #date = datetime.strptime(exec_date, '%Y-%m-%d %H')
@@ -195,6 +188,7 @@ def cargar_data(exec_date):
     primary_key=[f"primary key({name})"]
     column_defs.append(primary_key[0])
     # Combine column definitions into the CREATE TABLE statement
+    table_name = 'base_paises_resumen'
     table_schema = f"""
         CREATE TABLE IF NOT EXISTS {table_name} (
             {', '.join(column_defs)}
@@ -203,7 +197,6 @@ def cargar_data(exec_date):
     # Crear la tabla
     from psycopg2.extras import execute_values
     cur = conn.cursor()
-    table_name = 'base_paises_resumen'
     cur.execute(table_schema)
     # Generar los valores a insertar
     values = [tuple(x) for x in dataframe.to_numpy()]
@@ -220,7 +213,61 @@ def cargar_data(exec_date):
     execute_values(cur, insert_sql, values)
     cur.execute("COMMIT")
     print('Proceso terminado')
-    
+    # ti.xcom_push(
+    #     key='carga_data',
+    #     value=True,
+    # )
+
+
+def enviar(ti):
+    # folder = f'{dag_path}/processed_data'
+    # filename = ti.xcom_pull(key='nombre_data', task_ids='transformar_data')
+    # name = folder + '/' + filename + '.csv'
+    # if os.path.isfile(name):
+    # if ti.xcom_pull(key='carga_data', task_ids='cargar_data'):
+        try:
+            x=smtplib.SMTP('smtp.gmail.com',587)
+            x.starttls()
+            x.login('andii.andy@gmail.com','edbwwiqurfgoiwkj')
+            subject='Estado de ETL paises'
+            body_text='El proceso de ETL se ha ejecutado correctamente'
+            message='Subject: {}\n\n{}'.format(subject,body_text)
+            x.sendmail('andii.andy@gmail.com','andii.andy@gmail.com',message)
+            print('Exito')
+        except Exception as exception:
+            print(exception)
+            print('Fallo en el envio de correo de éxito')
+    # else:
+    #     try:
+    #         x=smtplib.SMTP('smtp.gmail.com',587)
+    #         x.starttls()
+    #         x.login('andii.andy@gmail.com','edbwwiqurfgoiwkj')
+    #         subject='Estado de ETL paises'
+    #         body_text='El proceso de ETL no se ejecutó correctamente'
+    #         message='Subject: {}\n\n{}'.format(subject,body_text)
+    #         x.sendmail('andii.andy@gmail.com','andii.andy@gmail.com',message)
+    #         print('Exito')
+    #     except Exception as exception:
+    #         print(exception)
+    #         print('Fallo en el envio de correo de éxito') 
+
+
+# argumentos por defecto para el DAG
+default_args = {
+    'owner': 'AndreaSA',
+    'start_date': datetime(2023,6,26),
+    'retries':5,
+    'retry_delay': timedelta(minutes=5)
+}
+
+BC_dag = DAG(
+    dag_id='ETL_paises',
+    default_args=default_args,
+    description='Agrega data de países de forma mensual',
+    schedule_interval="@daily",
+    catchup=False
+)
+
 # Tareas
 ##1. Extraccion
 task_1 = PythonOperator(
@@ -247,7 +294,7 @@ task_31= PythonOperator(
     dag=BC_dag
 )
 
-# 3.2 Envio final
+# 3.2 carga data
 task_32 = PythonOperator(
     task_id='cargar_data',
     python_callable=cargar_data,
@@ -255,5 +302,19 @@ task_32 = PythonOperator(
     dag=BC_dag,
 )
 
+# 3.3 Envio email
+# task_33 = PythonSensor(
+#     task_id='envio_email',
+#     python_callable=enviar,
+#     dag=BC_dag,
+# )
+
+# 3.3 Envio email
+task_33 = PythonOperator(
+    task_id='envio_email',
+    python_callable=enviar,
+    dag=BC_dag,
+)
+
 # Definicion orden de tareas
-task_1 >> task_2 >> task_31 >> task_32
+task_1 >> task_2 >> task_31 >> task_32 >> task_33
